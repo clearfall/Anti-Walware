@@ -1,0 +1,354 @@
+<#
+.SYNOPSIS
+  Comprehensive (but not foolproof) PowerShell helper to check a Windows PC for malware-like indicators,
+  query antivirus products and Windows Defender exclusions, list common persistence vectors and browser extensions,
+  and offer to remediate Defender-detected threats.
+
+NOTES / WARNINGS
+  - This script relies primarily on Microsoft Defender cmdlets (available on modern Windows 10/11) and common OS artifacts.
+  - It is NOT a replacement for a full professional malware removal tool or human-led incident response.
+  - Running scans and deletion operations requires Administrator privileges. Run PowerShell as Administrator.
+  - The script attempts safe, commonly-available remediation (Defender scans). Manual file-delete actions are confirmed before running.
+  - If a third-party AV is installed, Defender may be limited; the script will still try to collect AV info and Defender data.
+
+USAGE
+  1. Open PowerShell as Administrator.
+  2. Unblock & run: Unblock-File .\Check-And-Clean-Malware.ps1; .\Check-And-Clean-Malware.ps1
+
+#>
+
+function Write-Green($text) {
+    Write-Host $text -ForegroundColor Green
+}
+function Write-Yellow($text) {
+    Write-Host $text -ForegroundColor Yellow
+}
+function Write-Red($text) {
+    Write-Host $text -ForegroundColor Red
+}
+
+# Ensure admin
+if (-not ([bool]([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltinRole] "Administrator"))) {
+    Write-Red "This script must be run as Administrator. Right-click PowerShell and choose 'Run as Administrator'. Exiting."
+    exit 1
+}
+
+Write-Yellow "Starting quick system checks and Defender-based scans..."
+$Timestamp = (Get-Date).ToString("s")
+Write-Host "Timestamp: $Timestamp"
+
+# 1) Update Windows Defender signatures (best-effort)
+try {
+    Write-Host "Updating Microsoft Defender signatures..."
+    # Use both cmdlet and MpCmdRun.exe for compatibility
+    try {
+        Update-MpSignature -ErrorAction Stop
+    } catch {
+        Write-Yellow "Update-MpSignature not available or failed; trying MpCmdRun.exe..."
+        $mpcmd = Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe"
+        if (Test-Path $mpcmd) {
+            & $mpcmd -SignatureUpdate | Out-Null
+        } else {
+            Write-Yellow "MpCmdRun.exe not found at expected path."
+        }
+    }
+} catch {
+    Write-Yellow "Signature update failed: $($_.Exception.Message)"
+}
+
+# 2) Collect installed antivirus products (Security Center / WMI)
+$avProducts = @()
+try {
+    # Try SecurityCenter2 (recommended)
+    $avProducts = Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop |
+        Select-Object displayName,productState,pathToSignedProductExe | Sort-Object displayName
+    if ($avProducts.Count -eq 0) { throw "No AV product entries found in SecurityCenter2." }
+} catch {
+    Write-Yellow "Could not query SecurityCenter2 (maybe older OS or permissions). Trying WMI Win32_Product as fallback (may be slow)..."
+    try {
+        $avProducts = Get-WmiObject -Namespace root\SecurityCenter -Class AntiVirusProduct -ErrorAction Stop |
+            Select-Object displayName,pathToSignedProductExe
+    } catch {
+        Write-Yellow "AV product detection via SecurityCenter failed: $($_.Exception.Message)"
+    }
+}
+
+if ($avProducts -and $avProducts.Count -gt 0) {
+    Write-Host "`nDetected Antivirus products:"
+    $avProducts | ForEach-Object {
+        Write-Host "- $($_.displayName) `tExe: $($_.pathToSignedProductExe)"
+    }
+} else {
+    Write-Yellow "No antivirus products detected via SecurityCenter APIs."
+}
+
+# 3) List Microsoft Defender exclusions (whitelists) if Defender is present
+try {
+    $mpPrefs = Get-MpPreference -ErrorAction Stop
+    Write-Host "`nMicrosoft Defender exclusions (whitelists):"
+    Write-Host "  Exclusion Paths:"
+    if ($mpPrefs.ExclusionPath -and $mpPrefs.ExclusionPath.Count -gt 0) {
+        $mpPrefs.ExclusionPath | ForEach-Object { Write-Host "   - $_" }
+    } else { Write-Host "   (none)" }
+
+    Write-Host "  Exclusion Extensions:"
+    if ($mpPrefs.ExclusionExtension -and $mpPrefs.ExclusionExtension.Count -gt 0) {
+        $mpPrefs.ExclusionExtension | ForEach-Object { Write-Host "   - $_" }
+    } else { Write-Host "   (none)" }
+
+    Write-Host "  Exclusion Processes:"
+    if ($mpPrefs.ExclusionProcess -and $mpPrefs.ExclusionProcess.Count -gt 0) {
+        $mpPrefs.ExclusionProcess | ForEach-Object { Write-Host "   - $_" }
+    } else { Write-Host "   (none)" }
+
+} catch {
+    Write-Yellow "Get-MpPreference not available or failed: $($_.Exception.Message)"
+}
+
+# 4) Run Defender Quick Scan and then Full Scan (collect threats)
+$allDetections = @()
+try {
+    Write-Host "`nRunning Microsoft Defender Quick Scan (this may take several minutes)..."
+    Start-MpScan -ScanType QuickScan -ErrorAction SilentlyContinue | Out-Null
+} catch {
+    Write-Yellow "Start-MpScan quick scan not available or failed: $($_.Exception.Message)"
+}
+
+# Wait a short moment for events to appear
+Start-Sleep -Seconds 5
+
+try {
+    # Get any recent detections
+    $detections = Get-MpThreatDetection -ErrorAction SilentlyContinue
+    if ($detections) {
+        $allDetections += $detections
+    }
+} catch {
+    Write-Yellow "Get-MpThreatDetection not available or failed: $($_.Exception.Message)"
+}
+
+# Also perform a deeper full scan (user should be aware it can take long)
+Write-Host "`nStarting a Full Scan (may take a long time). You can cancel with CTRL+C."
+try {
+    Start-MpScan -ScanType FullScan -AsJob -ErrorAction SilentlyContinue | Out-Null
+    # Wait for background job(s) completion - poll Defender detection list every 15s for up to 10 minutes
+    $pollLimit = 40
+    $i = 0
+    while ($i -lt $pollLimit) {
+        Start-Sleep -Seconds 15
+        try {
+            $detections = Get-MpThreatDetection -ErrorAction SilentlyContinue
+            if ($detections) {
+                $allDetections = ($allDetections + $detections) | Select-Object -Unique
+            }
+        } catch { }
+        $i++
+    }
+} catch {
+    Write-Yellow "Full scan launch failed or was restricted: $($_.Exception.Message)"
+}
+
+# 5) Additional heuristics: unsigned running processes and suspicious autoruns
+Write-Host "`nCollecting running processes and checking for unsigned executables (suspicious indicator)..."
+$procSuspicious = @()
+Get-Process | ForEach-Object {
+    $p = $_
+    try {
+        $path = ($p | Get-Process -ErrorAction SilentlyContinue).Path
+        if ($path) {
+            $sig = Get-AuthenticodeSignature -FilePath $path -ErrorAction SilentlyContinue
+            if ($sig -and $sig.Status -eq 'UnknownError' -or $sig -and $sig.Status -eq 'NotSigned') {
+                $procSuspicious += [PSCustomObject]@{
+                    ProcessName = $p.ProcessName
+                    Id = $p.Id
+                    Path = $path
+                    Signature = if ($sig) { $sig.Status } else { "No signature info" }
+                }
+            }
+        }
+    } catch { }
+}
+if ($procSuspicious.Count -gt 0) {
+    Write-Host "Potentially unsigned processes (showing up to 50):"
+    $procSuspicious | Select-Object -First 50 | Format-Table -AutoSize
+} else {
+    Write-Host "No obviously unsigned running processes found (by this quick check)."
+}
+
+# 6) Startup/Autoruns: Registry Run, Scheduled Tasks, Startup folder
+Write-Host "`nChecking common persistence vectors (startup items, scheduled tasks)..."
+
+# Registry Run keys (HKLM and HKCU)
+$runKeys = @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+    "HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Run",
+    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+)
+foreach ($k in $runKeys) {
+    try {
+        $vals = Get-ItemProperty -Path $k -ErrorAction SilentlyContinue
+        if ($vals) {
+            Write-Host "`n$k contents:"
+            $vals.PSObject.Properties | Where-Object { $_.Name -ne "PSPath" -and $_.Name -ne "PSParentPath" -and $_.Name -ne "PSChildName" } |
+                ForEach-Object { Write-Host " - $($_.Name) : $($_.Value)" }
+        }
+    } catch { }
+}
+
+# Scheduled Tasks (list tasks with "Author" or suspicious triggers)
+try {
+    $tasks = Get-ScheduledTask | Select-Object TaskName,TaskPath,State,Author
+    Write-Host "`nScheduled Tasks (showing tasks with non-Microsoft authors or unusual paths):"
+    $tasks | Where-Object { $_.Author -and $_.Author -notlike "*Microsoft*" } | ForEach-Object {
+        Write-Host " - $($_.TaskPath)$($_.TaskName) (Author: $($_.Author), State: $($_.State))"
+    }
+} catch {
+    Write-Yellow "Unable to enumerate scheduled tasks: $($_.Exception.Message)"
+}
+
+# Startup folder
+$startupPaths = @(
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp",
+    "$env:AppData\Microsoft\Windows\Start Menu\Programs\Startup"
+)
+foreach ($sp in $startupPaths) {
+    if (Test-Path $sp) {
+        Write-Host "`nStartup folder: $sp"
+        Get-ChildItem -Path $sp -Force | ForEach-Object { Write-Host " - $($_.Name) -> $($_.FullName)" }
+    }
+}
+
+# 7) Browser extensions: Chrome and Edge (basic enumeration of extension folders)
+Write-Host "`nEnumerating browser extension folders for Chrome and Edge (local profile directories). This lists installed extension IDs -- not the human-readable name in all cases."
+function List-ExtensionsInProfile($productName, $basePath) {
+    if (Test-Path $basePath) {
+        Write-Host "`n$productName extensions (folder: $basePath):"
+        Get-ChildItem -Path $basePath -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host " - Extension ID: $($_.Name) (versions: " + ((Get-ChildItem -Path $_.FullName -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ", ") + ")"
+        }
+    } else {
+        Write-Yellow "$productName profile path not found: $basePath"
+    }
+}
+
+$chromeExtPath = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Extensions"
+$edgeExtPath = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Extensions"
+List-ExtensionsInProfile "Google Chrome" $chromeExtPath
+List-ExtensionsInProfile "Microsoft Edge" $edgeExtPath
+
+# 8) Collect Defender detection results again and present them
+try {
+    $dets = Get-MpThreatDetection -ErrorAction SilentlyContinue
+    if ($dets) {
+        # Normalize to unique names
+        $unique = $dets | Select-Object ThreatID,ThreatName,ResourcesDetected,ActionSuccess | Sort-Object ThreatName -Unique
+        $unique | ForEach-Object {
+            $name = $_.ThreatName
+            if (-not $name) { $name = $_.ThreatID }
+            Write-Green "`nMalware found : $name"
+            Write-Host "  Resources detected: $($_.ResourcesDetected -join ', ')"
+            Write-Host "  Remediation succeeded: $($_.ActionSuccess)"
+        }
+    } else {
+        Write-Host "`nNo Microsoft Defender detections found by Get-MpThreatDetection at this time."
+    }
+} catch {
+    Write-Yellow "Unable to get final threat detection list: $($_.Exception.Message)"
+}
+
+# If we found nothing via Defender, still report any heuristics with "Malware found : <indicator>" in green for emphasis
+if (($dets -eq $null -or $dets.Count -eq 0) -and $procSuspicious.Count -gt 0) {
+    Write-Green "`nMalware found : Potential unsigned processes or suspicious autoruns (heuristic; investigate manually)."
+}
+
+# Ask the user if they want to clean up (use Defender remediation or manual file removal for detected resources)
+function Ask-YesNo($prompt) {
+    while ($true) {
+        $ans = Read-Host "$prompt (yes/no)"
+        switch ($ans.ToLower()) {
+            "y" { return $true }
+            "yes" { return $true }
+            "n" { return $false }
+            "no" { return $false }
+            default { Write-Host "Please answer yes or no." }
+        }
+    }
+}
+
+$haveDetections = ($dets -and $dets.Count -gt 0)
+$wantCleanup = $false
+if ($haveDetections) {
+    $wantCleanup = Ask-YesNo "Would you like to attempt automatic cleanup of Defender-detected items now?"
+} else {
+    $wantCleanup = Ask-YesNo "No Defender detections found. Do you still want to run a Full Defender scan with remediation now?"
+}
+
+if ($wantCleanup) {
+    Write-Host "`nAttempting remediation using Microsoft Defender..."
+    try {
+        # Start a remediation-enabled full scan (Start-MpScan will attempt remediation by default)
+        Start-MpScan -ScanType FullScan -ErrorAction Stop
+        Write-Host "Full scan (remediation) requested. Give Defender some time to complete."
+        # Re-check detections
+        Start-Sleep -Seconds 10
+        try {
+            $post = Get-MpThreatDetection -ErrorAction SilentlyContinue
+            if ($post -and $post.Count -gt 0) {
+                Write-Host "Post-clean detections (if any):"
+                $post | ForEach-Object {
+                    Write-Green "Malware found : $($_.ThreatName) (Resource(s): $($_.ResourcesDetected -join ', '))"
+                }
+            } else {
+                Write-Host "No threats reported after remediation attempt (or Defender will report later)."
+            }
+        } catch { }
+    } catch {
+        Write-Red "Defender remediation scan failed or was blocked: $($_.Exception.Message)"
+    }
+
+    # Offer manual deletion for detected resource paths (only if resources provided)
+    if ($dets -and $dets.Count -gt 0) {
+        $allPaths = $dets | ForEach-Object { $_.ResourcesDetected } | Where-Object { $_ } | Select-Object -Unique
+        if ($allPaths.Count -gt 0) {
+            Write-Host "`nDetected items with file paths:"
+            $allPaths | ForEach-Object { Write-Host " - $_" }
+            if (Ask-YesNo "Attempt to delete the above files now? (You should have Defender quarantine them; manual delete is optional)") {
+                foreach ($p in $allPaths) {
+                    try {
+                        if (Test-Path $p) {
+                            # Make backup by moving to %TEMP%\malware-removed-<timestamp>\
+                            $backupDir = Join-Path $env:TEMP ("malware-removed-$((Get-Date).ToString('yyyyMMdd-HHmmss'))")
+                            if (-not (Test-Path $backupDir)) { New-Item -Path $backupDir -ItemType Directory | Out-Null }
+                            $dest = Join-Path $backupDir ([IO.Path]::GetFileName($p))
+                            Move-Item -Path $p -Destination $dest -Force -ErrorAction Stop
+                            Write-Host "Moved $p -> $dest"
+                        } else {
+                            Write-Yellow "Path not found: $p"
+                        }
+                    } catch {
+                        Write-Red "Failed to remove $p : $($_.Exception.Message)"
+                    }
+                }
+            } else {
+                Write-Host "Skipping manual deletes."
+            }
+        }
+    }
+} else {
+    Write-Host "Skipping cleanup as requested."
+}
+
+Write-Host "`nScan summary / notes:"
+if ($dets -and $dets.Count -gt 0) {
+    Write-Green "Malware found : $($dets | Select-Object -ExpandProperty ThreatName -Unique -ErrorAction SilentlyContinue -Unique -ErrorAction SilentlyContinue)"
+} else {
+    Write-Host "No Defender-detected threats found by this script's queries at the time of checking."
+}
+
+Write-Host "Defender exclusions (whitelists) were printed earlier."
+Write-Host "Third-party AV products detected (if any) were listed earlier."
+Write-Host "Consider running additional third-party scanners (Malwarebytes, ESET Online Scanner, Kaspersky Rescue Disk) if you still suspect infection."
+Write-Host "`nIf you found things flagged by heuristics (unsigned processes, odd scheduled tasks), collect their paths and hashes and investigate further before deleting."
+
+Write-Host "`nFinished. Log file: The script does not automatically save a log; if you want one, re-run this script inside: Start-Transcript -Path C:\temp\malware-scan-log.txt"
